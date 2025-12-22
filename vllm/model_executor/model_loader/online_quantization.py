@@ -13,7 +13,7 @@ from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
 logger = init_logger(__name__)
 
-# Notes for Online Quantization
+# Notes for Online Quantization and Weight Reloading
 # In terms of state of checkpoints, quantization config and their
 # correspondance to online quantization:
 # | Use Case      | Checkpoints          |  model_config.quantization |
@@ -40,7 +40,7 @@ logger = init_logger(__name__)
 #       of the weights)
 #   UC2: process_weights_after_loading: any additional post processing
 
-# The process for weight reloading with online quantization
+# The process for weight reloading with online quantization (torchao)
 # (repeated run in RL training loop)
 # first run
 #  I1. load_weights: load bfloat16 weights
@@ -63,33 +63,62 @@ logger = init_logger(__name__)
 #    this will be skipped since it's already ran in
 #    load_weights
 
+# The process for weight reloading with MXFP4 (and similar quantization methods)
+# MXFP4 has pre-quantized checkpoints, but process_weights_after_loading
+# transforms the weight layouts (shuffling, reshaping) for GPU kernels.
+# The reload process is similar:
+# first run
+#  I1. load_weights: load quantized weights from checkpoint
+#  I2. process_weights_after_loading:
+#        record weight metadata and attributes for R1 and R2
+#        transform weights for kernel (shuffle, reshape, etc.)
+# subsequent run (e.g., after level 2 sleep wake-up)
+#  (beginning model weight is in kernel-transformed format)
+#  load_weights:
+#    R1. restore pre-transformed weight metadata (shapes before kernel transform)
+#    R2. restore the model weight attributes
+#    R3. reload quantized weights from checkpoint
+#    R4. transform weights (by calling process_weights_after_loading)
+#    R5. (workaround for cudagraph) restore original param objects
+
+# Quantization methods that require weight reload support
+# (i.e., their process_weights_after_loading changes weight shapes/layouts)
+QUANT_METHODS_REQUIRING_RELOAD_SUPPORT = frozenset({"torchao", "mxfp4"})
+
 
 def maybe_save_metadata_and_attributes_for_weight_reloading(
     model: nn.Module, model_config: ModelConfig
 ):
-    # following is to support on the fly quantization, currently only supported
-    # for torchao
-    if model_config.quantization != "torchao":
+    # Check if this quantization method requires reload support
+    quant_method = model_config.quantization
+    if quant_method not in QUANT_METHODS_REQUIRING_RELOAD_SUPPORT:
         return
 
-    from vllm.model_executor.model_loader.weight_utils import get_quant_config
+    # For torchao: only save for online quantization (non-serialized checkpoints)
+    if quant_method == "torchao":
+        from vllm.model_executor.model_loader.weight_utils import get_quant_config
 
-    quant_config = get_quant_config(model_config, None)
+        quant_config = get_quant_config(model_config, None)
 
-    # If checkpoint is already torchao serialized, this means it's
-    # pre-quantized quantization case, we'll skip saving the metadata
-    # Otherwise, this is Step I2 of initialization steps of
-    # online quantization
-    # This step record the weights metadata and weight attributes so we can
-    # restore the bfloat16 model weights during the relad step (R1 and R2)
-    # see Notes in online_quantization.py for more details
-    if not (
-        hasattr(quant_config, "is_checkpoint_torchao_serialized")
-        and not quant_config.is_checkpoint_torchao_serialized
-    ):
-        return
+        # If checkpoint is already torchao serialized, this means it's
+        # pre-quantized quantization case, we'll skip saving the metadata
+        # Otherwise, this is Step I2 of initialization steps of
+        # online quantization
+        # This step record the weights metadata and weight attributes so we can
+        # restore the bfloat16 model weights during the reload step (R1 and R2)
+        # see Notes in online_quantization.py for more details
+        if not (
+            hasattr(quant_config, "is_checkpoint_torchao_serialized")
+            and not quant_config.is_checkpoint_torchao_serialized
+        ):
+            return
 
-    # This is the I2 step of online quantiztion that saves
+    # For mxfp4: always save because process_weights_after_loading transforms
+    # weight layouts (shuffling, reshaping) for GPU kernels, regardless of
+    # whether the checkpoint is pre-quantized
+    # (mxfp4 checkpoints are always pre-quantized, but still need reload support)
+
+    # This is the I2 step that saves
     # metadata and attributes of weights so they can be used in R1 and
     # R2 step, note that we only save these during initialization
 
@@ -146,12 +175,17 @@ def _bond_method_to_cls(func, obj):
 
 def support_quantized_model_reload_from_hp_weights(original_load_weights):
     """Decorator for `load_weights` method for AutoWeightsLoader.load_weights to support
-    reloading high precision (bfloat16/float16/float32) weight for an already quantized
-    model, this involves restoring the weights to a high precision weights and
-    then online quantize the weights
+    reloading weights for models where process_weights_after_loading transforms
+    weight shapes/layouts.
+
+    This covers two cases:
+    1. Online quantization (torchao): loading high precision weights and quantizing
+    2. Kernel-specific transforms (mxfp4): loading quantized weights and reshaping
+       for GPU kernels
+
+    The decorator restores weights to their pre-process_weights_after_loading state,
+    reloads from checkpoint, and re-runs process_weights_after_loading.
     """
-    # online quantization, right now only enabled for
-    # torchao
     # R1, R2, R3, R4, R5 in the Notes
 
     def patched_model_load_weights(
@@ -174,15 +208,17 @@ def support_quantized_model_reload_from_hp_weights(original_load_weights):
 
         model_config = model._model_config
 
-        # TODO: Add fp8 support
-        assert model_config.quantization == "torchao", (
-            "online quantization is only enabled for torchao currently"
+        # Verify the quantization method supports weight reloading
+        assert model_config.quantization in QUANT_METHODS_REQUIRING_RELOAD_SUPPORT, (
+            f"weight reloading is only supported for "
+            f"{QUANT_METHODS_REQUIRING_RELOAD_SUPPORT}, "
+            f"got {model_config.quantization}"
         )
         # TODO: use create_weights to restore the weights to original state
 
-        # Step R1: First restore the quantized weights to original bfloat16
-        # weights, with original metadata (shape, dtype, device)
-        # and attributes, so that bfloat16 weights can be loaded properly
+        # Step R1: First restore the weights to their pre-process_weights_after_loading
+        # state, with original metadata (shape, dtype, device) and attributes,
+        # so that checkpoint weights can be loaded properly
         # TODO: maybe set remove_duplicate to True?
         original_quantized_weight_dict = dict(
             model.named_parameters(remove_duplicate=False)
@@ -236,13 +272,13 @@ def support_quantized_model_reload_from_hp_weights(original_load_weights):
                 if not hasattr(weight, attr_name):
                     setattr(weight, attr_name, _bond_method_to_cls(attr, weight))
 
-        # Step R3: reload bfloat16 / high precision weights
+        # Step R3: reload weights from checkpoint
         updated_params = original_load_weights(
             auto_weight_loader, weights, mapper=mapper
         )
 
-        # Step R4: online quantize the weights
-        # manually process weights after loading
+        # Step R4: process weights (quantize for torchao, transform for mxfp4)
+        # manually call process_weights_after_loading
         model.process_weights_after_loading_already_called = False
         if model_device is not None:
             process_weights_after_loading(model, model_config, model_device)

@@ -456,8 +456,8 @@ class GptOssModel(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 if weight_loader == default_weight_loader:
-                    # Handle size mismatch from MXFP4 padding during
-                    # process_weights_after_loading
+                    # Handle size mismatch between checkpoint (unpadded) and
+                    # param (padded for kernel alignment in create_weights)
                     if narrow_weight.shape != param.shape:
                         padded_weight = torch.zeros_like(param)
                         padded_weight[:, :narrow_weight.shape[1]] = narrow_weight
@@ -484,8 +484,9 @@ class GptOssModel(nn.Module):
                     if tp_rank != 0:
                         weight.zero_()
                 if weight_loader == default_weight_loader:
-                    # Handle size mismatch from MXFP4 padding during
-                    # process_weights_after_loading (e.g., 2880 -> 3072)
+                    # Handle size mismatch between checkpoint (unpadded) and
+                    # param (padded for kernel alignment in create_weights)
+                    # e.g., checkpoint has 2880, param has 3072
                     if weight.shape != param.shape:
                         padded_weight = torch.zeros_like(param)
                         padded_weight[:, :weight.shape[1]] = weight
