@@ -355,13 +355,16 @@ class GptOssModel(nn.Module):
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(
-                    param,
-                    narrow_weight,
-                    weight_name=name,
-                    shard_id=None,
-                    expert_id=None,
-                )
+                if weight_loader == default_weight_loader:
+                    weight_loader(param, narrow_weight)
+                else:
+                    weight_loader(
+                        param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                    )
                 loaded_params.add(name)
                 continue
             elif ".w2_weight_scale" in name:
@@ -375,13 +378,16 @@ class GptOssModel(nn.Module):
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(
-                    param,
-                    narrow_weight,
-                    weight_name=name,
-                    shard_id=None,
-                    expert_id=None,
-                )
+                if weight_loader == default_weight_loader:
+                    weight_loader(param, narrow_weight)
+                else:
+                    weight_loader(
+                        param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                    )
                 loaded_params.add(name)
                 continue
             elif ".w13_weight" in name:
@@ -401,13 +407,16 @@ class GptOssModel(nn.Module):
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(
-                    param,
-                    narrow_weight,
-                    weight_name=name,
-                    shard_id=None,
-                    expert_id=None,
-                )
+                if weight_loader == default_weight_loader:
+                    weight_loader(param, narrow_weight)
+                else:
+                    weight_loader(
+                        param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                    )
                 loaded_params.add(name)
                 continue
             elif ".w2_weight" in name:
@@ -424,13 +433,16 @@ class GptOssModel(nn.Module):
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(
-                    param,
-                    narrow_weight,
-                    weight_name=name,
-                    shard_id=None,
-                    expert_id=None,
-                )
+                if weight_loader == default_weight_loader:
+                    weight_loader(param, narrow_weight)
+                else:
+                    weight_loader(
+                        param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                    )
                 loaded_params.add(name)
                 continue
             elif ".w13_bias" in name:
@@ -443,13 +455,22 @@ class GptOssModel(nn.Module):
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(
-                    param,
-                    narrow_weight,
-                    weight_name=name,
-                    shard_id=None,
-                    expert_id=None,
-                )
+                if weight_loader == default_weight_loader:
+                    # Handle size mismatch from MXFP4 padding during
+                    # process_weights_after_loading
+                    if narrow_weight.shape != param.shape:
+                        padded_weight = torch.zeros_like(param)
+                        padded_weight[:, :narrow_weight.shape[1]] = narrow_weight
+                        narrow_weight = padded_weight
+                    weight_loader(param, narrow_weight)
+                else:
+                    weight_loader(
+                        param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                    )
                 loaded_params.add(name)
                 continue
             elif ".w2_bias" in name:
@@ -462,9 +483,18 @@ class GptOssModel(nn.Module):
                     # (only load on rank 0 to avoid duplication)
                     if tp_rank != 0:
                         weight.zero_()
-                weight_loader(
-                    param, weight, weight_name=name, shard_id=None, expert_id=None
-                )
+                if weight_loader == default_weight_loader:
+                    # Handle size mismatch from MXFP4 padding during
+                    # process_weights_after_loading (e.g., 2880 -> 3072)
+                    if weight.shape != param.shape:
+                        padded_weight = torch.zeros_like(param)
+                        padded_weight[:, :weight.shape[1]] = weight
+                        weight = padded_weight
+                    weight_loader(param, weight)
+                else:
+                    weight_loader(
+                        param, weight, weight_name=name, shard_id=None, expert_id=None
+                    )
                 loaded_params.add(name)
                 continue
             elif "sinks" in name:
