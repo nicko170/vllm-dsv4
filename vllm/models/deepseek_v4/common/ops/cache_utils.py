@@ -18,6 +18,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.models.deepseek_v4.ampere.platform import cutedsl_usable, use_ampere_fallback
+from vllm.v1.attention.ops.fp8_e4m3_compat import u8_e4m3_to_f32
 
 
 @triton.jit
@@ -216,6 +217,7 @@ def _dequantize_and_gather_k_kernel(
     output_dim: tl.constexpr,  # 512
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 7 real blocks
+    E4M3_VIA_BITS: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -273,11 +275,12 @@ def _dequantize_and_gather_k_kernel(
                 # Load quantized fp8 values (stored as uint8)
                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
 
-                # Bitcast uint8 back to fp8
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
+                # Bitcast uint8 back to fp8 -> fp32. On sm_8x Triton has no
+                # tl.float8e4nv, so decode the e4m3fn byte via integer bit ops.
+                if E4M3_VIA_BITS:
+                    x_float = u8_e4m3_to_f32(x_uint8)
+                else:
+                    x_float = x_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
 
                 # Load and decode UE8M0 scale
                 # UE8M0: scale = 2^(stored_value - 127)
@@ -347,6 +350,7 @@ def dequantize_and_gather_k_cache_triton(
         output_dim=512,
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
+        E4M3_VIA_BITS=use_ampere_fallback(),
     )
 
 
@@ -364,14 +368,9 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
 ) -> None:
-    if use_ampere_fallback():
-        # sm_8x: the Triton kernel uses tl.float8e4nv (unsupported). torch can
-        # load float8_e4m3fn -> bf16 natively, so dequant + gather in torch.
-        _dequantize_and_gather_k_cache_torch(
-            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
-        )
-        return
-
+    # sm_8x uses the Triton kernel too (it decodes the fp8 cache via integer
+    # bit ops under E4M3_VIA_BITS — fast and CUDA-graph-capturable, unlike the
+    # earlier Python-loop torch fallback). cutedsl is gated off for Ampere.
     if cutedsl_usable():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
