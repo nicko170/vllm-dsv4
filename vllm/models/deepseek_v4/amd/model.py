@@ -24,6 +24,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mhc import (
+    TILELANG_UNUSABLE,
     HCHeadOp,
     MHCFusedPostPreOp,
     MHCPostOp,
@@ -473,7 +474,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.mhc_pre = MHCPreOp()
         self.mhc_post = MHCPostOp()
         self.mhc_fused_post_pre = MHCFusedPostPreOp()
-        self.has_tilelang = has_tilelang()
+        # Ampere (sm_8x) has tilelang installed but its mHC kernels crash
+        # there, so treat it as unavailable -> use the unfused (native) mHC
+        # path. On ROCm/Hopper this is unchanged.
+        self.has_tilelang = has_tilelang() and not TILELANG_UNUSABLE
 
     def hc_pre(
         self,
@@ -683,7 +687,10 @@ class DeepseekV4Model(nn.Module):
             requires_grad=False,
         )
         self.hc_head_op = HCHeadOp()
-        self.has_tilelang = has_tilelang()
+        # Ampere (sm_8x) has tilelang installed but its mHC kernels crash
+        # there, so treat it as unavailable -> use the unfused (native) mHC
+        # path. On ROCm/Hopper this is unchanged.
+        self.has_tilelang = has_tilelang() and not TILELANG_UNUSABLE
         # Pre-hc_head residual stream buffer for the MTP draft. Stable
         # address (outside the cudagraph pool) so the copy_ in forward()
         # refreshes it correctly across captured shapes.

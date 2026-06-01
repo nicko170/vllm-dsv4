@@ -4,11 +4,32 @@ import torch
 
 # this import will also register the custom ops
 # import vllm.model_executor.kernels.mhc  # noqa: F401
+import vllm.envs as envs
 import vllm.model_executor.kernels.mhc as mhc_kernels
 from vllm.model_executor.custom_op import CustomOp
+from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 
 HAS_TILELANG = has_tilelang()
+
+
+def _tilelang_unusable_on_device() -> bool:
+    """tilelang mHC kernels crash on Ampere (sm_8x) — they assume sm_90+.
+
+    On such devices ``forward_cuda`` must use the non-tilelang reference
+    path (torch ``forward_native`` / the ``*_triton`` kernels) instead. Also
+    honours ``VLLM_DEEPSEEK_V4_FALLBACK`` so the path can be forced for tests.
+    """
+    if envs.VLLM_DEEPSEEK_V4_FALLBACK:
+        return True
+    if current_platform.is_cuda():
+        cap = current_platform.get_device_capability()
+        return cap is not None and cap.major < 9
+    return False
+
+
+# Resolved once at import; device/arch and the env flag are fixed per process.
+TILELANG_UNUSABLE = _tilelang_unusable_on_device()
 
 
 # --8<-- [start:mhc_pre]
@@ -41,6 +62,21 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if TILELANG_UNUSABLE:
+            return self.forward_native(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                norm_weight,
+                norm_eps,
+            )
         return torch.ops.vllm.mhc_pre_tilelang(
             residual,
             fn,
@@ -170,6 +206,8 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
+        if TILELANG_UNUSABLE:
+            return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
         return torch.ops.vllm.mhc_post_tilelang(
             x, residual, post_layer_mix, comb_res_mix
         )
@@ -243,6 +281,28 @@ class HCHeadOp(CustomOp):
         hc_mult, hidden_size = hidden_states.shape[-2:]
         outer_shape = hidden_states.shape[:-2]
         hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
+        if TILELANG_UNUSABLE:
+            # No torch forward_native for hc_head; use the Triton kernel
+            # (same path forward_hip takes when tilelang is unavailable).
+            num_tokens = hs_flat.shape[0]
+            out = torch.empty(
+                num_tokens,
+                hidden_size,
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
+            torch.ops.vllm.hc_head_triton(
+                hs_flat,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                out,
+                hidden_size,
+                rms_norm_eps,
+                hc_eps,
+                hc_mult,
+            )
+            return out.view(*outer_shape, hidden_size)
         out = torch.ops.vllm.hc_head_fused_kernel_tilelang(
             hs_flat,
             hc_fn,
