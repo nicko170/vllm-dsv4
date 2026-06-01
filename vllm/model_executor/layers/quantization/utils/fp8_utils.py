@@ -866,8 +866,18 @@ def w8a8_triton_block_scaled_mm(
 
     # Triton cannot currently bind E8M0 scale tensors directly. On ROCm,
     # DeepSeek-V4 checkpoints store block scales in exponent-only E8M0 format,
-    # so decode them to fp32 before launching the kernel.
-    if current_platform.is_rocm() or current_platform.is_xpu():
+    # so decode them to fp32 before launching the kernel. The same applies to
+    # the Ampere (sm_8x) fallback: these GPUs have no DeepGEMM/FP8 path and
+    # take this Triton block-scaled matmul with the model's native E8M0 scales,
+    # so they need the decode too. (Hopper/Blackwell go through DeepGEMM and
+    # never reach here with E8M0 scales, so their behaviour is unchanged.)
+    _cap = current_platform.get_device_capability()
+    _needs_e8m0_decode = (
+        current_platform.is_rocm()
+        or current_platform.is_xpu()
+        or (current_platform.is_cuda() and _cap is not None and _cap.major < 9)
+    )
+    if _needs_e8m0_decode:
         if As.dtype == torch.float8_e8m0fnu:
             As = _upcast_e8m0_to_fp32(As).contiguous()
         if Bs.dtype == torch.float8_e8m0fnu:
@@ -884,6 +894,26 @@ def w8a8_triton_block_scaled_mm(
     assert triton.cdiv(K, block_k) == Bs.shape[1]
 
     C_shape = A.shape[:-1] + (N,)
+
+    if current_platform.is_cuda() and _cap is not None and _cap.major < 9:
+        # Ampere (sm_8x) has no Triton fp8-e4m3 compute path
+        # ("fp8e4nv not supported in this architecture"), so dequantize the
+        # block-quantized operands to bf16 and run a bf16 GEMM. Unaccelerated
+        # but correct; FP8 linear/attention weights are a small fraction of
+        # params. (As/Bs were decoded from E8M0 to fp32 just above.)
+        A2 = A.reshape(M, A.shape[-1])
+        As2 = As.reshape(M, As.shape[-1]).to(torch.float32)
+        a_scale = As2.repeat_interleave(block_k, dim=1)[:, :K]
+        a_bf16 = (A2.to(torch.float32) * a_scale).to(torch.bfloat16)
+        b_scale = (
+            Bs.to(torch.float32)
+            .repeat_interleave(block_n, dim=0)[:N]
+            .repeat_interleave(block_k, dim=1)[:, :K]
+        )
+        b_bf16 = (B.to(torch.float32) * b_scale).to(torch.bfloat16)
+        out = torch.matmul(a_bf16, b_bf16.t())
+        return out.to(output_dtype).reshape(C_shape)
+
     C = A.new_empty(C_shape, dtype=output_dtype)
 
     configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
