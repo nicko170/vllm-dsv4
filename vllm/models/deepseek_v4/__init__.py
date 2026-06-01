@@ -14,14 +14,30 @@ from vllm.platforms import current_platform
 from .quant_config import DeepseekV4FP8Config
 
 # Pick the per-platform implementation. The NVIDIA branch is the static
-# default that mypy sees; the ROCm branch overrides it at runtime and is
-# kept type-compatible via ``# type: ignore[assignment]``.
-if TYPE_CHECKING or not current_platform.is_rocm():
+# default that mypy sees; the ROCm and Ampere branches override it at runtime
+# and are kept type-compatible via ``# type: ignore[assignment]``.
+#
+# Ampere (sm_8x) GPUs lack the FP8 tensor cores / DeepGEMM / FlashMLA /
+# tilelang kernels the NVIDIA path needs, so CUDA devices with compute
+# capability < 9 (or ``VLLM_DEEPSEEK_V4_FALLBACK=1``) route to the Ampere
+# fallback.  See ``ampere/platform.py``.
+if TYPE_CHECKING:
     from .nvidia.model import DeepseekV4ForCausalLM
     from .nvidia.mtp import DeepSeekV4MTP
-else:
+elif current_platform.is_rocm():
     from .amd.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
     from .amd.mtp import DeepSeekV4MTP  # type: ignore[assignment]
+else:
+    from .ampere.platform import use_ampere_fallback
+
+    if use_ampere_fallback():
+        from .ampere.model import (  # type: ignore[assignment]
+            DeepseekV4ForCausalLM,
+        )
+        from .ampere.mtp import DeepSeekV4MTP  # type: ignore[assignment]
+    else:
+        from .nvidia.model import DeepseekV4ForCausalLM
+        from .nvidia.mtp import DeepSeekV4MTP
 
 __all__ = [
     "DeepSeekV4MTP",

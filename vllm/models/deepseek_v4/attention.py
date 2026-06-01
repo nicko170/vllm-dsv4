@@ -77,6 +77,14 @@ logger = init_logger(__name__)
 
 def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
     """Pick the platform-specific V4 sparse MLA impl class. Sole platform check."""
+    from vllm.models.deepseek_v4.ampere.platform import use_ampere_fallback
+
+    if use_ampere_fallback():
+        from vllm.models.deepseek_v4.ampere.mla import (
+            DeepseekV4AmpereMLASparseImpl,
+        )
+
+        return DeepseekV4AmpereMLASparseImpl
     if current_platform.is_rocm():
         from vllm.models.deepseek_v4.amd.rocm import (
             DeepseekV4ROCMAiterMLASparseImpl,

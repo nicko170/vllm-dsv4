@@ -171,6 +171,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     VLLM_TPU_USING_PATHWAYS: bool = False
     VLLM_USE_DEEP_GEMM: bool = True
+    VLLM_DEEPSEEK_V4_FALLBACK: bool = False
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
@@ -1392,6 +1393,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Allow use of DeepGemm kernels for fused moe ops.
     "VLLM_USE_DEEP_GEMM": lambda: bool(int(os.getenv("VLLM_USE_DEEP_GEMM", "1"))),
+    # Force the DeepSeek-V4 Ampere (sm_8x) fallback execution path even on
+    # GPUs that would otherwise be auto-detected. The fallback is auto-enabled
+    # on CUDA devices with compute capability < 9 (no FP8/DeepGEMM/FlashMLA);
+    # this flag lets you force it on for testing on other devices.
+    "VLLM_DEEPSEEK_V4_FALLBACK": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_FALLBACK", "0"))
+    ),
     # Allow use of DeepGemm specifically for MoE fused ops (overrides only MoE).
     "VLLM_MOE_USE_DEEP_GEMM": lambda: bool(
         int(os.getenv("VLLM_MOE_USE_DEEP_GEMM", "1"))
