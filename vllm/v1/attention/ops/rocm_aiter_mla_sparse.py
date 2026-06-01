@@ -262,6 +262,49 @@ def cp_gather_indexer_k_quant_cache_triton(
     )
 
 
+def _fp8_paged_mqa_logits_n1_vec(
+    q, kv_cache, weights, context_lens, block_tables, max_model_len, fp8_dtype,
+):
+    """Vectorized next_n==1 paged MQA logits (no Python loop / .item()).
+
+    logit[b, t] = ( sum_h relu(K[b,t] . q[b,h]) * weights[b,h] ) * kscale[b,t],
+    masked to t < context_lens[b]. Reads the paged fp8 indexer cache
+    (dim fp8 bytes + 4-byte fp32 scale per token, grouped per block).
+    """
+    batch_size, _, _, dim = q.size()
+    block_size = kv_cache.shape[1]
+    dev = q.device
+    if context_lens.dim() > 1:
+        context_lens = context_lens.squeeze(-1)
+    context_lens = context_lens.to(dev)
+    P = block_tables.shape[1]
+    S = P * block_size
+    S = min(S, max_model_len)
+    P = S // block_size
+
+    kv_cache_flat = kv_cache.view(-1, block_size * (dim + 4))
+    pages = block_tables[:, :P].clamp(min=0).long()          # [B, P]
+    cache = kv_cache_flat[pages]                              # [B, P, bs*(dim+4)]
+    scale_off = block_size * dim
+    cval = cache[..., :scale_off].contiguous().view(dtype=fp8_dtype).to(torch.float32)
+    cval = cval.view(batch_size, S, dim)                     # [B, S, dim]
+    cscale = cache[..., scale_off:].contiguous().view(dtype=torch.float32)
+    cscale = cscale.view(batch_size, S)                      # [B, S]
+
+    qf = q[:, 0].to(torch.float32)                           # [B, H, dim]
+    score = torch.einsum("bsd,bhd->bsh", cval, qf)           # [B, S, H]
+    score = torch.relu(score) * weights.to(torch.float32)[:, None, :]
+    score = score.sum(dim=-1) * cscale                       # [B, S]
+
+    pos = torch.arange(S, device=dev)
+    mask = pos[None, :] < context_lens[:, None]              # [B, S]
+    logits = torch.full(
+        [batch_size, max_model_len], float("-inf"), device=dev, dtype=torch.float32
+    )
+    logits[:, :S] = torch.where(mask, score, float("-inf"))
+    return logits
+
+
 # Taken from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L156
 def fp8_paged_mqa_logits_torch(
     q: torch.Tensor,
@@ -276,41 +319,13 @@ def fp8_paged_mqa_logits_torch(
     fp8_dtype = current_platform.fp8_dtype()
     batch_size, next_n, _, dim = q.size()
     if next_n == 1:
-        block_size = kv_cache.shape[1]
-        logits = torch.full(
-            [batch_size, max_model_len],
-            float("-inf"),
-            device=q.device,
-            dtype=torch.float32,
+        # Vectorized, CUDA-graph-capturable: no Python loop / .item() (a host
+        # sync is illegal during graph capture). Equivalence to the per-request
+        # reference loop is unit-tested (artifacts/paged_logits_vec_test.py).
+        return _fp8_paged_mqa_logits_n1_vec(
+            q, kv_cache, weights, context_lens, block_tables, max_model_len,
+            fp8_dtype,
         )
-        if context_lens.dim() > 1:
-            context_lens = context_lens.squeeze(-1)
-        kv_cache_flat = kv_cache.view(-1, block_size * (dim + 4))
-        for i in range(batch_size):
-            q_i = q[i, 0].to(torch.float32)
-            q_scale = weights[i]
-            seq_len = int(context_lens[i].item())
-            assert seq_len <= max_model_len
-            num_pages = cdiv(seq_len, block_size)
-            padded_seq_len = num_pages * block_size
-            pages = block_tables[i, :num_pages]
-            cache = kv_cache_flat[pages]
-            scale_offset = block_size * dim
-            cache_value = (
-                cache[..., :scale_offset].view(dtype=fp8_dtype).to(torch.float32)
-            )
-            cache_scale = (
-                cache[..., scale_offset:].view(dtype=torch.float32).contiguous()
-            )
-            cache_value = cache_value.view(padded_seq_len, dim)
-            cache_scale = cache_scale.view(padded_seq_len)
-            score = F.linear(cache_value, q_i)
-            score = F.relu(score)
-            score *= q_scale[None, :]
-            score = score.sum(dim=1)
-            score *= cache_scale
-            logits[i, :seq_len] = score[:seq_len]
-        return logits
 
     kv_cache, scale = kv_cache[..., :dim], kv_cache[..., dim:]
     scale = scale.contiguous().view(torch.float)

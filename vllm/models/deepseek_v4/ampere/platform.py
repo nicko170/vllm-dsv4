@@ -9,10 +9,13 @@ in model/kernel modules.
 
 from __future__ import annotations
 
+import functools
+
 import vllm.envs as envs
 from vllm.platforms import current_platform
 
 
+@functools.cache
 def use_ampere_fallback() -> bool:
     """Return True if DeepSeek-V4 should use the Ampere fallback path.
 
@@ -33,6 +36,7 @@ def use_ampere_fallback() -> bool:
     return cap is not None and cap.major < 9
 
 
+@functools.cache
 def cutedsl_usable() -> bool:
     """Whether the CuTeDSL (cutlass DSL) kernels can be used.
 
