@@ -10,8 +10,16 @@ import torch.nn.functional as F
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
+from vllm.v1.attention.ops.fp8_e4m3_compat import u8_e4m3_to_f32
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+
+def _decode_e4m3_via_bits() -> bool:
+    """sm_8x: decode the fp8 KV cache via integer bit ops (no tl.float8e4nv)."""
+    from vllm.models.deepseek_v4.ampere.platform import use_ampere_fallback
+
+    return use_ampere_fallback()
 from vllm.utils.torch_utils import LayerNameType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
@@ -1171,6 +1179,7 @@ def _sparse_attn_decode_ragged_kernel(
     NOPE_BLOCK: tl.constexpr,
     ROPE_DIM: tl.constexpr,
     IS_FNUZ: tl.constexpr,
+    E4M3_VIA_BITS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -1227,7 +1236,9 @@ def _sparse_attn_decode_ragged_kernel(
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        if IS_FNUZ:
+        if E4M3_VIA_BITS:
+            x_fp8 = u8_e4m3_to_f32(x_uint8)
+        elif IS_FNUZ:
             x_fp8 = x_uint8.to(tl.float8e4b15, bitcast=True)
         else:
             x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
@@ -1295,7 +1306,9 @@ def _sparse_attn_decode_ragged_kernel(
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            if IS_FNUZ:
+            if E4M3_VIA_BITS:
+                x_fp8 = u8_e4m3_to_f32(x_uint8)
+            elif IS_FNUZ:
                 x_fp8 = x_uint8.to(tl.float8e4b15, bitcast=True)
             else:
                 x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
@@ -1574,6 +1587,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
         NOPE_BLOCK=triton.next_power_of_2(nope_head_dim),
         ROPE_DIM=rope_head_dim,
         IS_FNUZ=current_platform.is_fp8_fnuz(),
+        E4M3_VIA_BITS=_decode_e4m3_via_bits(),
         BLOCK_H=block_h,
         BLOCK_K=block_k,
         num_warps=8,

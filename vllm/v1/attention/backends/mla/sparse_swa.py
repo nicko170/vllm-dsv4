@@ -112,7 +112,12 @@ class DeepseekSparseSWABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["DeepseekSparseSWAMetadataBuilder"]:
-        if current_platform.is_rocm():
+        # The Ampere (sm_8x) fallback reuses the ROCm sparse-MLA decode path,
+        # which needs the ROCm SWA metadata (ragged indices etc.), so it uses
+        # the same SWA metadata builder.
+        from vllm.models.deepseek_v4.ampere.platform import use_ampere_fallback
+
+        if current_platform.is_rocm() or use_ampere_fallback():
             from vllm.models.deepseek_v4.amd.rocm import (
                 DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
             )
