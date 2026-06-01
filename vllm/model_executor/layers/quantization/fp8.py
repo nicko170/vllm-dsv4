@@ -49,6 +49,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _upcast_e8m0_to_fp32,
     create_fp8_input_scale,
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
@@ -390,6 +391,37 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if (
+            self.block_quant
+            and self.use_marlin
+            and getattr(layer, "is_bmm", False)
+        ):
+            # DeepSeek-V4 grouped o-projection (wo_a) is an `is_bmm` linear
+            # consumed by a grouped FP8 einsum, not the linear `apply`. The
+            # Marlin kernel would repack `weight` into an opaque layout the
+            # einsum can't read, so instead keep the block-FP8 weights reshaped
+            # to (g, r, d) with fp32 (g, r/128, d/128) block scales — the
+            # layout the (Ampere) bf16 o-projection consumes. On Hopper the
+            # DeepGEMM linear kernel performs the equivalent reshape itself.
+            assert self.weight_block_size is not None
+            g = layer.bmm_batch_size
+            bn, bk = self.weight_block_size
+            wq = layer.weight
+            ws = layer.weight_scale_inv
+            r = wq.size(0) // g
+            d = wq.size(1)
+            if ws.dtype == torch.float8_e8m0fnu:
+                ws = _upcast_e8m0_to_fp32(ws)
+            else:
+                ws = ws.to(torch.float32)
+            replace_parameter(layer, "weight", wq.view(g, r, d).contiguous())
+            replace_parameter(
+                layer,
+                "weight_scale_inv",
+                ws.view(g, r // bn, d // bk).contiguous(),
+            )
+            layer.input_scale = None
+            return
         if self.use_marlin:
             # Only Marlin kernels support `marlin_input_dtype`; guard to avoid
             # AttributeError if backend selection changes.

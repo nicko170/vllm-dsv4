@@ -31,3 +31,15 @@ def use_ampere_fallback() -> bool:
         return True
     cap = current_platform.get_device_capability()
     return cap is not None and cap.major < 9
+
+
+def cutedsl_usable() -> bool:
+    """Whether the CuTeDSL (cutlass DSL) kernels can be used.
+
+    They are installed in many environments but the JIT compiler crashes
+    (``DSLRuntimeError``) on Ampere (sm_8x). When the Ampere fallback is
+    active, callers must use their Triton ``else`` branch instead.
+    """
+    from vllm.utils.import_utils import has_cutedsl
+
+    return has_cutedsl() and not use_ampere_fallback()

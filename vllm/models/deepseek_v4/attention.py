@@ -323,6 +323,42 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
             return self.wo_b(z.flatten(1))
 
+        # Ampere (sm_8x) has no FP8 tensor cores / DeepGEMM, so replace the
+        # fp8 inv-rope + fp8_einsum o-projection with an all-bf16 reference:
+        # inverse RoPE, group heads (G groups x heads_per_group*head_dim), then
+        # a dequant'd einsum with wo_a. Dims are inferred from the actual
+        # (TP-sharded) wo_a weight, so it is correct for any TP (unlike
+        # rocm_inv_rope_einsum, which assumes the unsharded o_lora_rank).
+        from vllm.models.deepseek_v4.ampere.platform import use_ampere_fallback
+
+        if use_ampere_fallback():
+            from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+                _apply_inv_rope_ref,
+                _expand_2d_block_scales,
+            )
+
+            o_ref = _apply_inv_rope_ref(
+                self.rotary_emb, o, positions, self.rope_head_dim
+            ).to(torch.bfloat16)
+            num_tokens = o_ref.shape[0]
+            g = self.n_local_groups
+            o_ref = o_ref.reshape(num_tokens, g, -1)  # [T, G, heads_per_group*head_dim]
+            inner = o_ref.shape[-1]
+            w = self.wo_a.weight.view(g, -1, inner)  # [G, o_lora_local, inner]
+            if hasattr(self.wo_a, "weight_scale_inv"):
+                wscale = _expand_2d_block_scales(
+                    self.wo_a.weight_scale_inv.view(
+                        g, -1, self.wo_a.weight_scale_inv.shape[-1]
+                    ),
+                    w.shape[1],
+                    inner,
+                )
+                w_bf16 = (w.to(torch.float32) * wscale).to(torch.bfloat16)
+            else:
+                w_bf16 = w.to(torch.bfloat16)
+            z = torch.einsum("tgd,grd->tgr", o_ref, w_bf16)
+            return self.wo_b(z.flatten(1))
+
         # O projection: inverse RoPE + FP8 quant + einsum + wo_b
         o_fp8, o_scale = fused_inv_rope_fp8_quant(
             o,

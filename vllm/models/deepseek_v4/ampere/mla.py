@@ -2,64 +2,28 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Ampere (sm_8x) sparse-MLA attention implementation for DeepSeek-V4.
 
-FlashMLA has no Ampere sparse build, so this path uses a dense / Triton
-reference instead.  Phase 1 only wires up the dispatch and the backend
-metadata (kv-cache shape etc., reused from the FlashMLA backend); the actual
-attention kernel is filled in at Phase 5 — until then ``forward_mqa`` raises a
-clear NotImplementedError so we can prove the capability gate routes here
-(past the DeepGEMM/FlashMLA wall) rather than aborting in DeepGEMM.
+FlashMLA has no Ampere sparse build, so we reuse the ROCm sparse-MLA
+implementation, which despite its name is **portable Triton + torch**:
+``rocm_sparse_attn_decode`` / ``rocm_sparse_attn_prefill`` and the
+``DeepseekV4ROCMAiter*`` metadata builders contain no aiter/HIP/is_rocm code
+(verified) — they build on the CUDA FlashMLA backend + Triton kernels, which
+run on Ampere. This is the "dense/Triton sparse-MLA fallback" of Phase 5.
+
+If a kernel hits the sm_86 shared-memory ceiling (~100 KB) we can later tune
+BLOCK_SIZE / num_stages, but the math is arch-agnostic.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-import torch
-
-from vllm.models.deepseek_v4.nvidia.flashmla import (
-    DeepseekV4FlashMLASparseBackend,
-    DeepseekV4SparseMLAAttentionImpl,
+from vllm.models.deepseek_v4.amd.rocm import (
+    DeepseekV4ROCMAiterMLASparseImpl,
 )
 
-if TYPE_CHECKING:
-    from vllm.models.deepseek_v4.attention import DeepseekV4MLAAttention
 
+class DeepseekV4AmpereMLASparseImpl(DeepseekV4ROCMAiterMLASparseImpl):
+    """Sparse MLA for Ampere — reuses the portable Triton ROCm impl.
 
-class DeepseekV4AmpereMLASparseBackend(DeepseekV4FlashMLASparseBackend):
-    """Reuse the FlashMLA backend's kv-cache spec / metadata, but report a
-    distinct name and route to the Ampere impl."""
-
-    @staticmethod
-    def get_name() -> str:
-        return "V4_AMPERE_SPARSE"
-
-    @staticmethod
-    def get_impl_cls() -> type["DeepseekV4SparseMLAAttentionImpl"]:
-        return DeepseekV4AmpereMLASparseImpl
-
-
-class DeepseekV4AmpereMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
-    """Dense/Triton sparse-MLA fallback for Ampere (sm_8x)."""
-
-    backend_cls = DeepseekV4AmpereMLASparseBackend
-
-    @classmethod
-    def get_padded_num_q_heads(cls, num_heads: int) -> int:
-        # The dense reference path has no FP8-decode head-count constraint,
-        # so no padding is required.
-        return num_heads
-
-    @classmethod
-    def forward_mqa(  # type: ignore[override]
-        cls,
-        layer: "DeepseekV4MLAAttention",
-        q: torch.Tensor,
-        kv: torch.Tensor,
-        positions: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
-        raise NotImplementedError(
-            "DeepSeek-V4 Ampere sparse-MLA attention is not implemented yet "
-            "(Phase 5). The capability gate correctly routed to the Ampere "
-            "fallback path instead of the DeepGEMM/FlashMLA path."
-        )
+    Inherits ``backend_cls`` (``DeepseekV4ROCMAiterMLASparseBackend``), its
+    Triton metadata builders, ``forward_mqa`` (decode + prefill), and
+    ``get_padded_num_q_heads`` (identity — no FP8-decode head constraint).
+    """
