@@ -4,7 +4,61 @@
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.models.deepseek_v4.ampere.platform import cutedsl_usable
+from vllm.models.deepseek_v4.ampere.platform import cutedsl_usable, use_ampere_fallback
+
+
+def _fused_indexer_q_rope_quant_fp8_torch(
+    positions: torch.Tensor,
+    index_q: torch.Tensor,
+    index_q_cos_sin_cache: torch.Tensor,
+    index_weights: torch.Tensor,
+    index_weights_softmax_scale: float,
+    index_weights_head_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure-torch FP8 indexer-Q RoPE+quant for Ampere (sm_8x).
+
+    Triton cannot emit ``fp8e4nv`` on sm_8x, but ``torch`` can cast to
+    ``float8_e4m3fn`` there. This mirrors ``_fused_indexer_q_rope_quant_kernel``
+    exactly: GPT-J interleaved RoPE on the trailing rope dims, a bf16 round
+    before the absmax, a ue8m0 (power-of-two) per-(token,head) scale, and the
+    same weight-fold (weights * q_scale * softmax_scale * head_scale).
+    """
+    T, H, D = index_q.shape
+    rot = index_q_cos_sin_cache.shape[-1]
+    half = rot // 2
+    nope = D - rot
+    q = index_q.float()
+    cos = index_q_cos_sin_cache[positions, :half].float()[:, None, :]  # [T,1,half]
+    sin = index_q_cos_sin_cache[positions, half:rot].float()[:, None, :]
+
+    rotp = q[..., nope:]
+    x_even = rotp[..., 0::2]
+    x_odd = rotp[..., 1::2]
+    r_even = (x_even * cos - x_odd * sin).to(torch.bfloat16).float()
+    r_odd = (x_odd * cos + x_even * sin).to(torch.bfloat16).float()
+
+    amax = torch.maximum(r_even.abs().amax(-1), r_odd.abs().amax(-1))  # [T,H]
+    if nope > 0:
+        amax = torch.maximum(amax, q[..., :nope].abs().amax(-1))
+    scale = torch.clamp(amax, min=1e-4) / 448.0
+    scale = torch.exp2(torch.ceil(torch.log2(scale)))  # ue8m0, [T,H]
+    inv = (1.0 / scale)[..., None]
+
+    out = torch.empty_like(index_q, dtype=torch.float8_e4m3fn)
+    if nope > 0:
+        out[..., :nope] = (q[..., :nope] * inv).to(torch.float8_e4m3fn)
+    rdeq = torch.empty_like(rotp)
+    rdeq[..., 0::2] = r_even * inv
+    rdeq[..., 1::2] = r_odd * inv
+    out[..., nope:] = rdeq.to(torch.float8_e4m3fn)
+
+    weights_out = (
+        index_weights.float()
+        * scale
+        * index_weights_softmax_scale
+        * index_weights_head_scale
+    )
+    return out, weights_out
 
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
 MXFP4_BLOCK_SIZE = 32
@@ -396,6 +450,17 @@ def fused_indexer_q_rope_quant(
             index_q_packed,
             index_q_scale.view(torch.int32).squeeze(-1),
         ), index_weights_out
+
+    if use_ampere_fallback():
+        # sm_8x: Triton cannot emit fp8e4nv; do the FP8 RoPE+quant in torch.
+        return _fused_indexer_q_rope_quant_fp8_torch(
+            positions,
+            index_q,
+            index_q_cos_sin_cache,
+            index_weights,
+            index_weights_softmax_scale,
+            index_weights_head_scale,
+        )
 
     index_q_fp8 = torch.empty_like(index_q, dtype=torch.float8_e4m3fn)
     if cutedsl_usable():

@@ -31,6 +31,14 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+
+def _use_ampere_indexer_fallback() -> bool:
+    """sm_8x has no DeepGEMM; the indexer MQA-logits run in bf16 (torch)."""
+    from vllm.models.deepseek_v4.ampere.platform import use_ampere_fallback
+
+    return use_ampere_fallback()
+
+
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
@@ -229,6 +237,21 @@ def sparse_attn_indexer(
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
                 )
+            elif _use_ampere_indexer_fallback():
+                # sm_8x has no DeepGEMM; compute MQA logits in bf16 (torch).
+                # Only the FP8 (non-FP4) cache path is supported here.
+                assert not use_fp4_cache
+                from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+                    fp8_mqa_logits_torch,
+                )
+
+                logits = fp8_mqa_logits_torch(
+                    q_slice_cast,
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
             else:
                 logits = fp8_fp4_mqa_logits(
                     (q_slice_cast, q_scale_slice),
@@ -318,6 +341,21 @@ def sparse_attn_indexer(
                 seq_lens_xpu,
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
+                max_model_len,
+            )
+        elif _use_ampere_indexer_fallback():
+            # sm_8x has no DeepGEMM; compute paged MQA logits in bf16 (torch).
+            assert not use_fp4_cache
+            from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+                fp8_paged_mqa_logits_torch,
+            )
+
+            logits = fp8_paged_mqa_logits_torch(
+                padded_q_quant_cast,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
                 max_model_len,
             )
         else:
@@ -440,7 +478,11 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if (
+            current_platform.is_cuda()
+            and not has_deep_gemm()
+            and not _use_ampere_indexer_fallback()
+        ):
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
             )

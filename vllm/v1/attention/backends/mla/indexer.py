@@ -608,8 +608,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
 
-            # DeepGEMM is required for the paged MQA logits on CUDA devices
-            if current_platform.is_cuda() and has_deep_gemm():
+            # DeepGEMM is required for the paged MQA logits on CUDA devices.
+            # The Ampere (sm_8x) fallback uses a torch paged-MQA-logits path
+            # that doesn't consume this scheduler metadata, and DeepGEMM is
+            # unsupported there, so skip the (missing) DeepGEMM call.
+            from vllm.models.deepseek_v4.ampere.platform import use_ampere_fallback
+
+            if (
+                current_platform.is_cuda()
+                and has_deep_gemm()
+                and not use_ampere_fallback()
+            ):
                 self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.storage_block_size,

@@ -17,7 +17,7 @@ preparation.
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.models.deepseek_v4.ampere.platform import cutedsl_usable
+from vllm.models.deepseek_v4.ampere.platform import cutedsl_usable, use_ampere_fallback
 
 
 @triton.jit
@@ -364,6 +364,14 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
 ) -> None:
+    if use_ampere_fallback():
+        # sm_8x: the Triton kernel uses tl.float8e4nv (unsupported). torch can
+        # load float8_e4m3fn -> bf16 natively, so dequant + gather in torch.
+        _dequantize_and_gather_k_cache_torch(
+            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
+        )
+        return
+
     if cutedsl_usable():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
@@ -378,6 +386,55 @@ def dequantize_and_gather_k_cache(
     dequantize_and_gather_k_cache_triton(
         out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
     )
+
+
+def _dequantize_and_gather_k_cache_torch(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor | None,
+    block_table: torch.Tensor,
+    block_size: int,
+    offset: int,
+) -> None:
+    """Pure-torch equivalent of dequantize_and_gather_k_cache_triton for sm_8x.
+
+    Per-token cache layout (fp8_ds_mla), grouped within a paged block of
+    ``block_size`` tokens: [block_size x 576B token data][block_size x 8B
+    ue8m0 scales]. Token data = 448 fp8 (uint8) + 64 bf16 (128B). The 448 fp8
+    dims use 7 ue8m0 block scales (one per 64). Output row = 512 (448 dequant
+    + 64 bf16 passthrough).
+    """
+    FP8_DIM = 448
+    BF16_DIM = 64
+    TDS = 576  # bytes of token data (448 fp8 + 64*2 bf16)
+    SCALE_DIM = 8
+    QBLK = 64
+    NQ = 7
+    dev = out.device
+    num_blocks = k_cache.shape[0]
+    kc = k_cache.reshape(num_blocks, -1).view(torch.uint8)  # [num_blocks, B*584]
+    arange_tds = torch.arange(TDS, device=dev)
+    arange_sc = torch.arange(SCALE_DIM, device=dev)
+    num_reqs = seq_lens.shape[0]
+    for r in range(num_reqs):
+        seq_len = int(seq_lens[r].item())
+        gl = int(gather_lens[r].item()) if gather_lens is not None else seq_len
+        if gl <= 0:
+            continue
+        start = seq_len - gl
+        pos = torch.arange(start, start + gl, device=dev)
+        blk = pos // block_size
+        pib = (pos % block_size).long()
+        phys = block_table[r, blk].long()  # [gl]
+        data = kc[phys[:, None], (pib * TDS)[:, None] + arange_tds[None, :]]  # [gl,576]
+        fp8 = data[:, :FP8_DIM].contiguous().view(torch.float8_e4m3fn).float()
+        bf16 = data[:, FP8_DIM:TDS].contiguous().view(torch.bfloat16)  # [gl,64]
+        sbase = block_size * TDS + pib * SCALE_DIM
+        sc = kc[phys[:, None], sbase[:, None] + arange_sc[None, :]][:, :NQ].float()
+        scale = torch.exp2(sc - 127.0).repeat_interleave(QBLK, dim=1)[:, :FP8_DIM]
+        out[r, offset : offset + gl, :FP8_DIM] = (fp8 * scale).to(out.dtype)
+        out[r, offset : offset + gl, FP8_DIM : FP8_DIM + BF16_DIM] = bf16.to(out.dtype)
 
 
 def compute_global_topk_indices_and_lens(
