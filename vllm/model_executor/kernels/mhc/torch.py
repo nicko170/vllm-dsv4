@@ -1,6 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
+
+try:
+    from vllm.model_executor.kernels.mhc.sinkhorn_triton import mhc_sinkhorn
+
+    _HAS_SINKHORN_TRITON = True
+except Exception:  # triton unavailable / import error
+    _HAS_SINKHORN_TRITON = False
 
 
 def mhc_pre_torch(
@@ -75,11 +84,21 @@ def mhc_pre_torch(
     comb_logits = mixes[:, 2 * hc_mult :].view(num_tokens, hc_mult, hc_mult) * hc_scale[
         2
     ] + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
-    comb_mix = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
-    comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
-    for _ in range(sinkhorn_repeat - 1):
-        comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
+    if (
+        _HAS_SINKHORN_TRITON
+        and os.environ.get("VLLM_MHC_SINKHORN", "1") == "1"
+        and comb_logits.is_cuda
+    ):
+        # Fused Triton sinkhorn: collapses the row-softmax + `sinkhorn_repeat`
+        # iterations (each a row/col normalize with a data dependency, i.e. ~40
+        # sequential reduce launches) into a single per-token kernel.
+        comb_mix = mhc_sinkhorn(comb_logits, hc_sinkhorn_eps, sinkhorn_repeat)
+    else:
+        comb_mix = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
         comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+        for _ in range(sinkhorn_repeat - 1):
+            comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
+            comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
 
     layer_input = torch.sum(
         pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1
@@ -104,3 +123,16 @@ def mhc_post_torch(
     )
     post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
     return (mixed_residual + post_term).to(residual.dtype)
+
+
+# On Ampere (sm_8x) the tilelang fused mHC kernels are unusable, so the model
+# falls back to these eager torch ops. The 20-iteration sinkhorn loop alone
+# launches ~40 tiny reduce kernels per call (~3400/token across the 86 mHC
+# calls), which is the single largest chunk of decode GPU time. torch.compile
+# fuses each function into a handful of kernels (the unrolled sinkhorn loop is
+# kept in registers), cutting both kernel count and memory traffic. Gated by
+# env for A/B testing; safe inside vLLM's FULL cudagraph because default-mode
+# torch.compile does not install its own cudagraphs.
+if os.environ.get("VLLM_MHC_COMPILE", "0") == "1":
+    mhc_pre_torch = torch.compile(mhc_pre_torch, dynamic=True, fullgraph=True)
+    mhc_post_torch = torch.compile(mhc_post_torch, dynamic=True, fullgraph=True)

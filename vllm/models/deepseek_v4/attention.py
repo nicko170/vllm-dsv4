@@ -344,18 +344,26 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             g = self.n_local_groups
             o_ref = o_ref.reshape(num_tokens, g, -1)  # [T, G, heads_per_group*head_dim]
             inner = o_ref.shape[-1]
-            w = self.wo_a.weight.view(g, -1, inner)  # [G, o_lora_local, inner]
-            if hasattr(self.wo_a, "weight_scale_inv"):
-                wscale = _expand_2d_block_scales(
-                    self.wo_a.weight_scale_inv.view(
-                        g, -1, self.wo_a.weight_scale_inv.shape[-1]
-                    ),
-                    w.shape[1],
-                    inner,
-                )
-                w_bf16 = (w.to(torch.float32) * wscale).to(torch.bfloat16)
-            else:
-                w_bf16 = w.to(torch.bfloat16)
+            # wo_a is a static FP8 block-quantized weight; dequantizing it to
+            # bf16 (incl. the fp32 intermediate + block-scale expansion) every
+            # forward costs ~10ms/step across the 43 layers. Cache the bf16
+            # result once — the address is stable so it is cudagraph-safe.
+            w_bf16 = getattr(self, "_wo_a_bf16_cache", None)
+            if w_bf16 is None:
+                w = self.wo_a.weight.view(g, -1, inner)  # [G, o_lora_local, inner]
+                if hasattr(self.wo_a, "weight_scale_inv"):
+                    wscale = _expand_2d_block_scales(
+                        self.wo_a.weight_scale_inv.view(
+                            g, -1, self.wo_a.weight_scale_inv.shape[-1]
+                        ),
+                        w.shape[1],
+                        inner,
+                    )
+                    w_bf16 = (w.to(torch.float32) * wscale).to(torch.bfloat16)
+                else:
+                    w_bf16 = w.to(torch.bfloat16)
+                self._wo_a_bf16_cache = w_bf16.contiguous()
+                w_bf16 = self._wo_a_bf16_cache
             z = torch.einsum("tgd,grd->tgr", o_ref, w_bf16)
             return self.wo_b(z.flatten(1))
 
