@@ -154,5 +154,9 @@ def mhc_post_torch(
 # env for A/B testing; safe inside vLLM's FULL cudagraph because default-mode
 # torch.compile does not install its own cudagraphs.
 if os.environ.get("VLLM_MHC_COMPILE", "0") == "1":
-    mhc_pre_torch = torch.compile(mhc_pre_torch, dynamic=True, fullgraph=True)
-    mhc_post_torch = torch.compile(mhc_post_torch, dynamic=True, fullgraph=True)
+    _mode = os.environ.get("VLLM_MHC_COMPILE_MODE", "default")
+    _kw = {"dynamic": True, "fullgraph": True}
+    if _mode != "default":
+        _kw["mode"] = _mode  # e.g. max-autotune-no-cudagraphs -> Triton matmuls
+    mhc_pre_torch = torch.compile(mhc_pre_torch, **_kw)
+    mhc_post_torch = torch.compile(mhc_post_torch, **_kw)
