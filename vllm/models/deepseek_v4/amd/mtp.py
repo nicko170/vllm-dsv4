@@ -183,9 +183,16 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
 
         # Three aux streams shared across all MTP layers, mirroring
         # DeepseekV4Model. ROCm runs the same work serially for now.
+        # Ampere (sm_8x) fallback: also run serially — the draft is a single
+        # layer (overlap is negligible) and the aux-stream event dance breaks
+        # CUDA-graph capture of the draft (the indexer runs on an aux stream
+        # that isn't in the capture), which is required for MTP spec-decode to
+        # be fast.
+        from vllm.models.deepseek_v4.ampere.platform import use_ampere_fallback
+
         aux_stream_list = (
             None
-            if current_platform.is_rocm()
+            if (current_platform.is_rocm() or use_ampere_fallback())
             else [torch.cuda.Stream() for _ in range(3)]
         )
 
