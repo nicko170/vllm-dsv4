@@ -68,8 +68,17 @@ def mhc_pre_torch(
     num_tokens = residual_flat.shape[0]
     fn_flat = fn
 
-    x = residual_flat.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
-    mixes = torch.matmul(x, fn_flat.t())
+    x_bf16 = residual_flat.view(num_tokens, hc_mult * hidden_size)  # bf16 residual
+    x = x_bf16.to(torch.float32)
+    if os.environ.get("VLLM_MHC_TF32", "1") == "1":
+        # Mixing matmul in bf16 (tensor cores). x is a bf16 residual upcast to
+        # fp32, so bf16 here loses nothing on x — only fn drops to bf16. The
+        # result is RMS-normalized then fed to sigmoid/softmax/sinkhorn gates,
+        # which tolerate it. The fp32 path is a skinny (N=24) GEMM with no
+        # tensor cores -> ~19% of long-prompt prefill. sqrsum stays fp32.
+        mixes = torch.matmul(x_bf16, fn_flat.t().to(torch.bfloat16)).to(torch.float32)
+    else:
+        mixes = torch.matmul(x, fn_flat.t())
     sqrsum = x.square().sum(dim=-1, keepdim=True)
     mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
 
@@ -116,11 +125,22 @@ def mhc_post_torch(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    mixed_residual = torch.einsum(
-        "...ij,...ih->...jh",
-        comb_res_mix.to(torch.float32),
-        residual.to(torch.float32),
-    )
+    if os.environ.get("VLLM_MHC_TF32", "1") == "1":
+        # Residual-mixing einsum in bf16 (tensor cores; accumulates in fp32).
+        # residual is the bf16 residual stream (no loss from bf16 here); only
+        # the [.,4,4] coupling drops to bf16. This is ~19% of long-prompt
+        # prefill as an fp32 batched GEMM (ampere_sgemm_NxN_nt, no tensor cores).
+        mixed_residual = torch.einsum(
+            "...ij,...ih->...jh",
+            comb_res_mix.to(torch.bfloat16),
+            residual.to(torch.bfloat16),
+        ).to(torch.float32)
+    else:
+        mixed_residual = torch.einsum(
+            "...ij,...ih->...jh",
+            comb_res_mix.to(torch.float32),
+            residual.to(torch.float32),
+        )
     post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
     return (mixed_residual + post_term).to(residual.dtype)
 
