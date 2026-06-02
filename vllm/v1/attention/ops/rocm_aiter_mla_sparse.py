@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from importlib.util import find_spec
 
 import torch
@@ -305,6 +306,57 @@ def _fp8_paged_mqa_logits_n1_vec(
     return logits
 
 
+def _fp8_paged_mqa_logits_vec(
+    q, kv_cache, weights, context_lens, block_tables, max_model_len, fp8_dtype,
+):
+    """Vectorized paged MQA logits for next_n >= 1 (no Python loop / .item(), so
+    it is CUDA-graph-capturable — required for MTP spec-decode, where the indexer
+    runs with next_n = num_spec_tokens + 1). Generalizes
+    ``_fp8_paged_mqa_logits_n1_vec``; equivalence to the per-request reference
+    loop is unit-tested (artifacts/paged_logits_vec_test.py). Handles both a
+    single context length per request ([B] / [B,1] -> consecutive query
+    positions) and per-position lengths ([B, next_n])."""
+    batch_size, next_n, H, dim = q.size()
+    block_size = kv_cache.shape[1]
+    dev = q.device
+    P = block_tables.shape[1]
+    S = min(P * block_size, max_model_len)
+    P = S // block_size
+
+    kv_cache_flat = kv_cache.view(-1, block_size * (dim + 4))
+    pages = block_tables[:, :P].clamp(min=0).long()          # [B, P]
+    cache = kv_cache_flat[pages]                              # [B, P, bs*(dim+4)]
+    scale_off = block_size * dim
+    cval = cache[..., :scale_off].contiguous().view(dtype=fp8_dtype).to(torch.float32)
+    cval = cval.view(batch_size, S, dim)                     # [B, S, dim]
+    cscale = cache[..., scale_off:].contiguous().view(dtype=torch.float32)
+    cscale = cscale.view(batch_size, S)                      # [B, S]
+
+    qf = q.to(torch.float32)                                  # [B, n, H, dim]
+    score = torch.einsum("bsd,bnhd->bnsh", cval, qf)         # [B, n, S, H]
+    score = torch.relu(score) * weights.to(torch.float32).view(batch_size, next_n, 1, H)
+    score = score.sum(dim=-1) * cscale[:, None, :]          # [B, n, S]
+
+    cl = context_lens.to(dev)
+    if cl.dim() > 1 and cl.shape[-1] == next_n:
+        q_offsets = cl.reshape(batch_size, next_n).to(torch.long) - 1   # [B, n]
+    else:
+        cl = cl.reshape(batch_size, -1)[:, 0] if cl.dim() > 1 else cl
+        q_offsets = cl[:, None].to(torch.long) - next_n + torch.arange(
+            next_n, device=dev
+        )[None, :]
+    pos = torch.arange(S, device=dev)
+    mask = pos[None, None, :] <= q_offsets[:, :, None]       # [B, n, S]
+    logits = torch.full(
+        [batch_size * next_n, max_model_len], float("-inf"),
+        device=dev, dtype=torch.float32,
+    )
+    logits.view(batch_size, next_n, max_model_len)[:, :, :S] = torch.where(
+        mask, score, float("-inf")
+    )
+    return logits
+
+
 # Taken from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L156
 def fp8_paged_mqa_logits_torch(
     q: torch.Tensor,
@@ -326,6 +378,12 @@ def fp8_paged_mqa_logits_torch(
             q, kv_cache, weights, context_lens, block_tables, max_model_len,
             fp8_dtype,
         )
+    # next_n > 1 (MTP spec-decode): the per-request loop below uses .item(),
+    # which is illegal during CUDA-graph capture. Use the vectorized path so the
+    # MTP draft/verify forward can be captured.
+    return _fp8_paged_mqa_logits_vec(
+        q, kv_cache, weights, context_lens, block_tables, max_model_len, fp8_dtype,
+    )
 
     kv_cache, scale = kv_cache[..., :dim], kv_cache[..., dim:]
     scale = scale.contiguous().view(torch.float)
@@ -520,19 +578,41 @@ def fp8_mqa_logits_torch(
     k = k_fp8.to(torch.bfloat16)
     q = q.to(torch.bfloat16)
     device = q.device
+    M = q.shape[0]
+    if scale.dim() > 1:
+        scale = scale.reshape(-1)  # [N]
 
-    mask_lo = (
-        torch.arange(0, seq_len_kv, device=device)[None, :] >= cu_seqlen_ks[:, None]
-    )
-    mask_hi = (
-        torch.arange(0, seq_len_kv, device=device)[None, :] < cu_seqlen_ke[:, None]
-    )
-    mask = mask_lo & mask_hi
+    # FlashIndexer: fused Triton kernel (tensor-core dots + fused
+    # relu/weight/scale/mask, no [H,M,N] materialization) — much faster than the
+    # tiled-torch path below for long-context prefill. Validated in
+    # artifacts/flash_indexer_test.py. Opt out with VLLM_FLASHINDEXER=0.
+    if os.environ.get("VLLM_FLASHINDEXER", "1") == "1":
+        from vllm.v1.attention.ops.flash_indexer_triton import (
+            flash_mqa_logits_triton,
+        )
 
-    score = torch.einsum("mhd,nd->hmn", q, k).float() * scale
-    logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
-    logits = logits.masked_fill(~mask, float("-inf"))
+        return flash_mqa_logits_triton(
+            q, k, scale, weights, cu_seqlen_ks, cu_seqlen_ke
+        )
 
+    # Tile over the key dimension. The naive einsum materializes the full
+    # [H, M, N] score tensor (H=64), which is 17GB at N=128k -> OOM / very slow.
+    # Tiling keeps the transient at [H, M, TILE] and only ever materializes the
+    # [M, N] output. bf16 inputs -> tensor-core GEMM. (FlashIndexer kernel fuses
+    # this with the top-k to avoid the [M, N] write too.)
+    wt = weights.unsqueeze(-1).transpose(0, 1)  # [H, M, 1]
+    ks = cu_seqlen_ks[:, None]
+    ke = cu_seqlen_ke[:, None]
+    ar = torch.arange(0, seq_len_kv, device=device)
+    logits = torch.empty([M, seq_len_kv], device=device, dtype=torch.float32)
+    TILE = 2048
+    for n0 in range(0, seq_len_kv, TILE):
+        n1 = min(n0 + TILE, seq_len_kv)
+        score = torch.einsum("mhd,nd->hmn", q, k[n0:n1]).float() * scale[n0:n1]
+        lt = (score.relu() * wt).sum(dim=0)  # [M, Nt]
+        col = ar[n0:n1][None, :]
+        mask = (col >= ks) & (col < ke)
+        logits[:, n0:n1] = lt.masked_fill(~mask, float("-inf"))
     return logits
 
 
