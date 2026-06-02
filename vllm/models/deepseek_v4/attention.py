@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -25,7 +26,10 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_q_kv_rmsnorm,
 )
 from vllm.utils.deep_gemm import fp8_einsum
-from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_inv_rope_einsum
+from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+    _apply_gptj_inv_rope_ref as _gptj_inv_rope,
+    rocm_inv_rope_einsum,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -73,6 +77,29 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+
+_OPROJ_FUSE = os.environ.get("VLLM_OPROJ_FUSE", "0") == "1"
+
+
+def _ampere_oproj_einsum(o, positions, cos_sin_cache, w_bf16, rope_dim, g):
+    """Fused inverse-RoPE + grouped dequant-einsum o-projection (Ampere).
+
+    GPT-J/interleaved inverse RoPE (the model uses is_neox_style=False) then the
+    grouped einsum against the cached bf16 wo_a. Under max-autotune torch.compile
+    inductor folds the RoPE pointwise into the matmul, replacing the separate
+    cutlass BMM + splitK reduction + the rope elementwise kernels.
+    """
+    o_ref = _gptj_inv_rope(o, positions, cos_sin_cache, rope_dim).to(torch.bfloat16)
+    nt = o_ref.shape[0]
+    o_ref = o_ref.reshape(nt, g, -1)
+    return torch.einsum("tgd,grd->tgr", o_ref, w_bf16).flatten(1)
+
+
+if _OPROJ_FUSE:
+    _ampere_oproj_einsum = torch.compile(
+        _ampere_oproj_einsum, dynamic=True, mode="max-autotune-no-cudagraphs"
+    )
 
 
 def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
@@ -337,13 +364,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 _expand_2d_block_scales,
             )
 
-            o_ref = _apply_inv_rope_ref(
-                self.rotary_emb, o, positions, self.rope_head_dim
-            ).to(torch.bfloat16)
-            num_tokens = o_ref.shape[0]
+            num_tokens = o.shape[0]
             g = self.n_local_groups
-            o_ref = o_ref.reshape(num_tokens, g, -1)  # [T, G, heads_per_group*head_dim]
-            inner = o_ref.shape[-1]
+            inner = o.shape[1] * o.shape[2] // g  # heads_per_group*head_dim
             # wo_a is a static FP8 block-quantized weight; dequantizing it to
             # bf16 (incl. the fp32 intermediate + block-scale expansion) every
             # forward costs ~10ms/step across the 43 layers. Cache the bf16
@@ -364,6 +387,18 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     w_bf16 = w.to(torch.bfloat16)
                 self._wo_a_bf16_cache = w_bf16.contiguous()
                 w_bf16 = self._wo_a_bf16_cache
+            if _OPROJ_FUSE:
+                # fused inv-RoPE + grouped dequant-einsum (max-autotune Triton)
+                z = _ampere_oproj_einsum(
+                    o, positions, self.rotary_emb.cos_sin_cache,
+                    w_bf16, self.rope_head_dim, g,
+                )
+                return self.wo_b(z)
+            o_ref = (
+                _apply_inv_rope_ref(self.rotary_emb, o, positions, self.rope_head_dim)
+                .to(torch.bfloat16)
+                .reshape(num_tokens, g, -1)
+            )
             z = torch.einsum("tgd,grd->tgr", o_ref, w_bf16)
             return self.wo_b(z.flatten(1))
 
